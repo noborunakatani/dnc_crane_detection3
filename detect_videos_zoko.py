@@ -97,6 +97,11 @@ def invoke_ocr_subprocess(
 ) -> Optional[Path]:
     """Run the OCR magnification pipeline and return the resulting CSV path."""
 
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        LOGGER.warning(f"Unable to create OCR output directory {output_dir}: {exc}")
+
     cmd = [
         sys.executable,
         str(ocr_script_path),
@@ -125,6 +130,25 @@ def invoke_ocr_subprocess(
         return None
 
     return csv_path
+
+
+class OCRMagnificationTracker:
+    """Track OCR magnification values across video frames."""
+
+    def __init__(self, entries: List[Tuple[int, int]]):
+        self.entries = entries
+        self.index = 0
+        self.current: Optional[int] = None
+
+    def update(self, frame_number: int) -> Optional[int]:
+        if frame_number < 0:
+            return self.current
+
+        while self.index < len(self.entries) and frame_number >= self.entries[self.index][0]:
+            self.current = self.entries[self.index][1]
+            self.index += 1
+
+        return self.current
 
 
 def load_ocr_results(csv_path: Path) -> List[Tuple[int, int]]:
@@ -412,9 +436,10 @@ def run(
 
     # Prepare OCR-based magnification tracking
     ocr_entries: List[Tuple[int, int]] = []
+    magnification_tracker: Optional[OCRMagnificationTracker] = None
     current_magnification: Optional[int] = None
-    ocr_index = 0
-    frame_number = 0
+    processed_frame_counter = 0
+    last_logged_magnification: Optional[int] = None
 
     if ocr_script_path and isinstance(ocr_script_path, (str, Path)):
         ocr_script = Path(ocr_script_path)
@@ -438,8 +463,7 @@ def run(
         if ocr_csv_path:
             ocr_entries = load_ocr_results(ocr_csv_path)
             if ocr_entries:
-                current_magnification = ocr_entries[0][1]
-                camera_params.focal_length_mm = compute_focal_length_from_magnification(current_magnification)
+                magnification_tracker = OCRMagnificationTracker(ocr_entries)
         else:
             LOGGER.warning('OCR magnification data could not be prepared; using default focal length.')
     elif ocr_output_dir:
@@ -466,14 +490,7 @@ def run(
                 continue
             prev_im = im
 
-        frame_number += skip_step
-        if ocr_entries:
-            while ocr_index < len(ocr_entries) and frame_number >= ocr_entries[ocr_index][0]:
-                current_magnification = ocr_entries[ocr_index][1]
-                ocr_index += 1
-            if current_magnification:
-                camera_params.focal_length_mm = compute_focal_length_from_magnification(current_magnification)
-                s += f" Magnification:{current_magnification}x Focal:{camera_params.focal_length_mm:.1f}mm"
+        processed_frame_counter += skip_step
 
         t1 = time_sync()
         im = torch.from_numpy(im).to(device)
@@ -515,16 +532,43 @@ def run(
             imc = im0.copy() if save_crop else im0  # for save_crop
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
 
+            if isinstance(frame, (int, float)):
+                candidate_frame = int(frame)
+                if candidate_frame < processed_frame_counter:
+                    current_frame_id = processed_frame_counter
+                else:
+                    current_frame_id = candidate_frame
+                    processed_frame_counter = candidate_frame
+            else:
+                processed_frame_counter += skip_step
+                current_frame_id = processed_frame_counter
+
+            if magnification_tracker:
+                magnification_value = magnification_tracker.update(current_frame_id)
+                if magnification_value is not None:
+                    if magnification_value != current_magnification:
+                        camera_params.focal_length_mm = compute_focal_length_from_magnification(magnification_value)
+                    current_magnification = magnification_value
+                    if magnification_value != last_logged_magnification:
+                        s += f" Magnification:{magnification_value}x Focal:{camera_params.focal_length_mm:.1f}mm"
+                        last_logged_magnification = magnification_value
+
             if not webcam:
                 curr_time = datetime.fromtimestamp(frame/30).strftime('%H:%M:%S.%f')
-                cv2.putText(im0, 'Frame: {0}'.format(frame), ((im0.shape[1]-300), 50), cv2.FONT_HERSHEY_SIMPLEX,  
+                cv2.putText(im0, 'Frame: {0}'.format(frame), ((im0.shape[1]-300), 50), cv2.FONT_HERSHEY_SIMPLEX,
                         1, (255, 255, 255), 2, cv2.LINE_AA)
             else:
                 curr_time = datetime.now(as_TKY).strftime("%Y-%m-%d %H:%M:%S.%f")
                 curr_time_vis = datetime.now(as_TKY).strftime("%Y-%m-%d %H:%M:%S")
-                cv2.putText(im0, 'Time: {0}'.format(curr_time_vis), ((im0.shape[1]-500), 50), cv2.FONT_HERSHEY_SIMPLEX,  
+                cv2.putText(im0, 'Time: {0}'.format(curr_time_vis), ((im0.shape[1]-500), 50), cv2.FONT_HERSHEY_SIMPLEX,
                         1, (255, 255, 255), 2, cv2.LINE_AA)
-                
+
+            if current_magnification is not None:
+                mag_text = f'Magnification: {current_magnification}x'
+                focal_text = f'Focal Length: {camera_params.focal_length_mm:.1f}mm'
+                cv2.putText(im0, mag_text, (25, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2, cv2.LINE_AA)
+                cv2.putText(im0, focal_text, (25, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2, cv2.LINE_AA)
+
             # Dequeue queues if k limit is reached
             if crane_height_queue.size() == c_k and crane_height_queue.size() != 0:
                 crane_height_queue.dequeue()
