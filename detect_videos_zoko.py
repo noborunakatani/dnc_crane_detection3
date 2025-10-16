@@ -25,8 +25,10 @@ Usage - formats:
 """
 
 import argparse
+import csv
 import os
 import sys
+import subprocess
 import pytz
 import math
 import numpy as np
@@ -79,6 +81,72 @@ class HeightEstimationResult:
     hook_height_m: float
     helmet_height_m: float
     relative_height_m: float
+
+
+def compute_focal_length_from_magnification(ocr_value: int) -> float:
+    """Compute focal length based on the OCR-derived magnification level."""
+
+    clamped_value = max(1, min(30, int(ocr_value)))
+    return 6.0 + (180.0 - 6.0) * (clamped_value - 1) / 29.0
+
+
+def invoke_ocr_subprocess(
+    source: str,
+    ocr_script_path: Path,
+    output_dir: Path,
+) -> Optional[Path]:
+    """Run the OCR magnification pipeline and return the resulting CSV path."""
+
+    cmd = [
+        sys.executable,
+        str(ocr_script_path),
+        str(source),
+        str(output_dir),
+    ]
+
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        if result.stdout:
+            LOGGER.info(result.stdout.strip())
+        if result.stderr:
+            LOGGER.warning(result.stderr.strip())
+    except FileNotFoundError as exc:
+        LOGGER.warning(f"Failed to start OCR subprocess: {exc}")
+        return None
+    except subprocess.CalledProcessError as exc:
+        LOGGER.warning(
+            f"OCR subprocess exited with status {exc.returncode}: {exc.stderr or exc.stdout}"
+        )
+        return None
+
+    csv_path = output_dir / 'ocr_result_complete_fixed.csv'
+    if not csv_path.exists():
+        LOGGER.warning(f"OCR results not found at {csv_path}")
+        return None
+
+    return csv_path
+
+
+def load_ocr_results(csv_path: Path) -> List[Tuple[int, int]]:
+    """Load OCR magnification results from CSV file."""
+
+    results: List[Tuple[int, int]] = []
+
+    try:
+        with open(csv_path, newline='', encoding='utf-8') as csv_file:
+            reader = csv.DictReader(csv_file)
+            for row in reader:
+                try:
+                    frame_number = int(float(row['frame_number']))
+                    value = int(float(row['ocr_value']))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                results.append((frame_number, max(1, min(30, value))))
+    except FileNotFoundError:
+        LOGGER.warning(f"OCR CSV file could not be opened: {csv_path}")
+
+    results.sort(key=lambda item: item[0])
+    return results
 
 
 def estimate_distance_m(pixel_height: float, real_height_mm: float, params: CameraParameters) -> Optional[float]:
@@ -271,6 +339,8 @@ def run(
         camera_height_m=10.0,
         min_zoom_level = 10, # minimum camera zoom level
         max_zoom_level = 25, # maximum camera zoom level
+        ocr_script_path: Optional[Path] = ROOT / 'read_magnification_video_complete_fixed.py',
+        ocr_output_dir: Optional[str] = 'C:/crane/ocr_output',
         device='',  # cuda device, i.e. 0 or 0,1,2,3 or cpu
         view_img=False,  # show results
         save_txt=False,  # save results to *.txt
@@ -340,6 +410,41 @@ def run(
         camera_height_m=camera_height_m,
     )
 
+    # Prepare OCR-based magnification tracking
+    ocr_entries: List[Tuple[int, int]] = []
+    current_magnification: Optional[int] = None
+    ocr_index = 0
+    frame_number = 0
+
+    if ocr_script_path and isinstance(ocr_script_path, (str, Path)):
+        ocr_script = Path(ocr_script_path)
+    else:
+        ocr_script = None
+
+    if ocr_output_dir:
+        ocr_output_path = Path(ocr_output_dir)
+    else:
+        ocr_output_path = None
+
+    if ocr_script and ocr_output_path:
+        ocr_csv_path = None
+        if not webcam and Path(source).is_file():
+            ocr_csv_path = invoke_ocr_subprocess(source, ocr_script, ocr_output_path)
+        else:
+            existing_csv = ocr_output_path / 'ocr_result_complete_fixed.csv'
+            if existing_csv.exists():
+                ocr_csv_path = existing_csv
+
+        if ocr_csv_path:
+            ocr_entries = load_ocr_results(ocr_csv_path)
+            if ocr_entries:
+                current_magnification = ocr_entries[0][1]
+                camera_params.focal_length_mm = compute_focal_length_from_magnification(current_magnification)
+        else:
+            LOGGER.warning('OCR magnification data could not be prepared; using default focal length.')
+    elif ocr_output_dir:
+        LOGGER.warning('OCR script path or output directory missing; skipping magnification integration.')
+
     # initialize queues
     helmet_height_queue = Queue()
     crane_height_queue = Queue()
@@ -360,6 +465,15 @@ def run(
             if (prev_im == im).all():
                 continue
             prev_im = im
+
+        frame_number += skip_step
+        if ocr_entries:
+            while ocr_index < len(ocr_entries) and frame_number >= ocr_entries[ocr_index][0]:
+                current_magnification = ocr_entries[ocr_index][1]
+                ocr_index += 1
+            if current_magnification:
+                camera_params.focal_length_mm = compute_focal_length_from_magnification(current_magnification)
+                s += f" Magnification:{current_magnification}x Focal:{camera_params.focal_length_mm:.1f}mm"
 
         t1 = time_sync()
         im = torch.from_numpy(im).to(device)
@@ -738,6 +852,8 @@ def parse_opt():
     parser.add_argument('--camera-height-m', type=float, default=10.0, help='installation height of the camera in meters')
     parser.add_argument('--min-zoom-level', type=int, default=10, help='minimum camera zoom level')
     parser.add_argument('--max-zoom-level', type=int, default=25, help='maximum camera zoom level')
+    parser.add_argument('--ocr-script', type=str, default=ROOT / 'read_magnification_video_complete_fixed.py', help='path to OCR magnification script')
+    parser.add_argument('--ocr-output-dir', type=str, default='C:/crane/ocr_output', help='directory used by the OCR magnification script')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--view-img', action='store_true', help='show results')
     parser.add_argument('--save-txt', action='store_true', help='save results to *.txt')
