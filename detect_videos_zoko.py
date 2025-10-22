@@ -84,11 +84,11 @@ class HeightEstimationResult:
     relative_height_m: float
 
 
-def compute_focal_length_from_magnification(ocr_value: int) -> float:
-    """Compute focal length based on the OCR-derived magnification level."""
+def compute_focal_length_from_magnification(magnification: float) -> float:
+    """Compute focal length based on the magnification level."""
 
-    clamped_value = max(1, min(30, int(ocr_value)))
-    return 6.0 + (180.0 - 6.0) * (clamped_value - 1) / 29.0
+    clamped_value = max(1.0, min(30.0, float(magnification)))
+    return 6.0 + (180.0 - 6.0) * (clamped_value - 1.0) / 29.0
 
 
 def invoke_ocr_subprocess(
@@ -122,20 +122,31 @@ def invoke_ocr_subprocess(
             ]
         )
 
+    elapsed: Optional[float] = None
+    start_time = time.time()
+
     try:
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        elapsed = time.time() - start_time
         if result.stdout:
             LOGGER.info(result.stdout.strip())
         if result.stderr:
             LOGGER.warning(result.stderr.strip())
     except FileNotFoundError as exc:
+        elapsed = time.time() - start_time
         LOGGER.warning(f"Failed to start OCR subprocess: {exc}")
+        print(f"OCR呼び出し時間: {elapsed:.2f}秒")
         return None
     except subprocess.CalledProcessError as exc:
+        elapsed = time.time() - start_time
         LOGGER.warning(
             f"OCR subprocess exited with status {exc.returncode}: {exc.stderr or exc.stdout}"
         )
+        print(f"OCR呼び出し時間: {elapsed:.2f}秒")
         return None
+
+    if elapsed is not None:
+        print(f"OCR呼び出し時間: {elapsed:.2f}秒")
 
     csv_path = output_dir / 'ocr_result_complete_fixed.csv'
     if not csv_path.exists():
@@ -381,6 +392,7 @@ def run(
         ocr_python: Optional[str] = None,
         ocr_extra_args: Optional[List[str]] = None,
         ocr_cache_ttl: float = 0.0,
+        manual_magnification: Optional[float] = None,
         device='',  # cuda device, i.e. 0 or 0,1,2,3 or cpu
         view_img=False,  # show results
         save_txt=False,  # save results to *.txt
@@ -453,9 +465,14 @@ def run(
     # Prepare OCR-based magnification tracking
     ocr_entries: List[Tuple[int, int]] = []
     magnification_tracker: Optional[OCRMagnificationTracker] = None
-    current_magnification: Optional[int] = None
+    current_magnification: Optional[float] = None
     processed_frame_counter = 0
-    last_logged_magnification: Optional[int] = None
+    last_logged_magnification: Optional[float] = None
+    manual_override = manual_magnification is not None
+
+    if manual_override:
+        current_magnification = float(manual_magnification)
+        camera_params.focal_length_mm = compute_focal_length_from_magnification(current_magnification)
 
     if ocr_script and isinstance(ocr_script, (str, Path)):
         ocr_script_path = Path(ocr_script)
@@ -491,7 +508,7 @@ def run(
     def refresh_ocr_results(force: bool = False) -> None:
         nonlocal magnification_tracker, ocr_entries, current_magnification, ocr_last_invoked
 
-        if not ocr_script_path or not ocr_output_path:
+        if manual_override or not ocr_script_path or not ocr_output_path:
             return
 
         now = time.time()
@@ -524,7 +541,7 @@ def run(
         else:
             LOGGER.warning('OCR magnification data could not be prepared; using default focal length.')
 
-    if ocr_script_path and ocr_output_path:
+    if not manual_override and ocr_script_path and ocr_output_path:
         if not webcam and Path(source).is_file():
             refresh_ocr_results(force=True)
         else:
@@ -537,7 +554,7 @@ def run(
                     LOGGER.warning('Existing OCR CSV did not contain usable magnification entries.')
             else:
                 refresh_ocr_results(force=True)
-    elif ocr_output_dir:
+    elif not manual_override and ocr_output_dir:
         LOGGER.warning('OCR script path or output directory missing; skipping magnification integration.')
 
     # initialize queues
@@ -554,7 +571,26 @@ def run(
     # Run inference
     model.warmup(imgsz=(1 if pt else bs, 3, *imgsz))  # warmup
     dt, seen = [0.0, 0.0, 0.0], 0
-    for path, im, im0s, vid_cap, s in dataset:
+    dataset_iter = iter(dataset)
+    frame_count = 0
+    fps_start_time = time.time()
+
+    while True:
+        fetch_start = time.time()
+        try:
+            path, im, im0s, vid_cap, s = next(dataset_iter)
+        except StopIteration:
+            break
+
+        frame_fetch_time = time.time() - fetch_start
+        print(f"フレーム取得時間: {frame_fetch_time:.2f}秒")
+
+        frame_count += 1
+        if frame_count % 30 == 0:
+            elapsed = max(1e-6, time.time() - fps_start_time)
+            avg_fps = frame_count / elapsed
+            print(f"{frame_count}フレーム時点: 平均FPS={avg_fps:.2f}")
+
         if webcam:
             # Optimize repeated img
             if (prev_im == im).all():
@@ -574,7 +610,10 @@ def run(
 
         # Inference
         visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if visualize else False
+        yolo_start = time.time()
         pred = model(im, augment=augment, visualize=visualize)
+        yolo_inference_time = time.time() - yolo_start
+        print(f"YOLO推論時間: {yolo_inference_time:.2f}秒")
         t3 = time_sync()
         dt[1] += t3 - t2
 
@@ -614,18 +653,26 @@ def run(
                 processed_frame_counter += skip_step
                 current_frame_id = processed_frame_counter
 
-            if ocr_cache_ttl > 0:
+            if ocr_cache_ttl > 0 and not manual_override:
                 refresh_ocr_results()
 
-            if magnification_tracker:
+            if manual_override and current_magnification is not None:
+                if current_magnification != last_logged_magnification:
+                    if float(current_magnification).is_integer():
+                        manual_mag_display = f"{int(current_magnification)}"
+                    else:
+                        manual_mag_display = f"{current_magnification:.1f}"
+                    s += f" Magnification:{manual_mag_display}x Focal:{camera_params.focal_length_mm:.1f}mm"
+                    last_logged_magnification = current_magnification
+            elif magnification_tracker:
                 magnification_value = magnification_tracker.update(current_frame_id)
                 if magnification_value is not None:
                     if magnification_value != current_magnification:
                         camera_params.focal_length_mm = compute_focal_length_from_magnification(magnification_value)
-                    current_magnification = magnification_value
+                    current_magnification = float(magnification_value)
                     if magnification_value != last_logged_magnification:
                         s += f" Magnification:{magnification_value}x Focal:{camera_params.focal_length_mm:.1f}mm"
-                        last_logged_magnification = magnification_value
+                        last_logged_magnification = float(magnification_value)
 
             if not webcam:
                 curr_time = datetime.fromtimestamp(frame/30).strftime('%H:%M:%S.%f')
@@ -638,7 +685,11 @@ def run(
                         1, (255, 255, 255), 2, cv2.LINE_AA)
 
             if current_magnification is not None:
-                mag_text = f'Magnification: {current_magnification}x'
+                if float(current_magnification).is_integer():
+                    mag_display = f'{int(current_magnification)}'
+                else:
+                    mag_display = f'{current_magnification:.1f}'
+                mag_text = f'Magnification: {mag_display}x'
                 focal_text = f'Focal Length: {camera_params.focal_length_mm:.1f}mm'
                 cv2.putText(im0, mag_text, (25, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2, cv2.LINE_AA)
                 cv2.putText(im0, focal_text, (25, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2, cv2.LINE_AA)
@@ -680,6 +731,9 @@ def run(
                     x_c, y_c, bbox_w, bbox_h = bbox_rel(*xyxy)
                     c = int(cls)
                     obj = names[c]
+                    magnification_csv_value = float(current_magnification) if current_magnification is not None else ''
+                    focal_length_csv_value = camera_params.focal_length_mm
+
                     data = [
                         frame,
                         curr_time,
@@ -702,6 +756,8 @@ def run(
                         0.0,
                         0.0,
                         0.0,
+                        magnification_csv_value,
+                        focal_length_csv_value,
                     ]
 
                     # append data to detection dictionary
@@ -889,6 +945,8 @@ def run(
                             'helmet_distance_m',
                             'relative_height_m',
                             'horizontal_distance_m',
+                            'magnification',
+                            'focal_length_mm',
                         ]
                         
                         with open(csv_path + '.csv', 'w+', encoding='UTF8', newline='') as csvf:
@@ -975,6 +1033,7 @@ def parse_opt():
     parser.add_argument('--ocr-python', type=str, default=None, help='python executable used to run the OCR script')
     parser.add_argument('--ocr-extra-args', nargs='*', default=None, help='additional arguments passed to the OCR script')
     parser.add_argument('--ocr-cache-ttl', type=float, default=0.0, help='seconds to cache OCR results before refreshing (0 disables refresh)')
+    parser.add_argument('--manual-magnification', type=float, default=None, help='manually specify camera magnification instead of using OCR results')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--view-img', action='store_true', help='show results')
     parser.add_argument('--save-txt', action='store_true', help='save results to *.txt')
